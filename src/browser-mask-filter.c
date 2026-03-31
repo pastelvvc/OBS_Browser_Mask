@@ -10,6 +10,7 @@
 #include <psapi.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
@@ -18,6 +19,7 @@
 struct browser_mask_filter_data {
     obs_source_t *context;
     char *process_names;
+    char *monitor_id;
     int capture_left;
     int capture_top;
     int capture_width;
@@ -30,6 +32,19 @@ struct enum_ctx {
     const char *process_names;
     RECT rect;
     bool found;
+};
+
+struct monitor_info {
+    char id[32];
+    RECT rect;
+};
+
+struct monitor_enum_ctx {
+    obs_property_t *list;
+    int index;
+    bool found;
+    const char *target_id;
+    struct monitor_info *out_info;
 };
 
 static const char *browser_mask_filter_get_name(void *type_data)
@@ -126,16 +141,12 @@ static BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lparam)
         return TRUE;
 
     RECT dwm_rect = {0};
-    HRESULT hr = DwmGetWindowAttribute(
-        hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &dwm_rect, sizeof(dwm_rect));
+    HRESULT hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &dwm_rect, sizeof(dwm_rect));
 
-    if (SUCCEEDED(hr) &&
-        dwm_rect.right > dwm_rect.left &&
-        dwm_rect.bottom > dwm_rect.top) {
+    if (SUCCEEDED(hr) && dwm_rect.right > dwm_rect.left && dwm_rect.bottom > dwm_rect.top)
         ctx->rect = dwm_rect;
-    } else {
+    else
         ctx->rect = r;
-    }
 
     ctx->found = true;
     return FALSE;
@@ -148,14 +159,106 @@ static bool detect_browser_rect(const char *process_names, RECT *out_rect)
 
     struct enum_ctx ctx = {0};
     ctx.process_names = process_names;
-    ctx.found = false;
-
     EnumWindows(enum_windows_proc, (LPARAM)&ctx);
 
     if (!ctx.found)
         return false;
 
     *out_rect = ctx.rect;
+    return true;
+}
+
+static BOOL CALLBACK enum_monitors_fill_list_proc(HMONITOR monitor, HDC hdc, LPRECT rect, LPARAM lparam)
+{
+    UNUSED_PARAMETER(monitor);
+    UNUSED_PARAMETER(hdc);
+
+    struct monitor_enum_ctx *ctx = (struct monitor_enum_ctx *)lparam;
+    char value[32];
+    char label[128];
+    int width = rect->right - rect->left;
+    int height = rect->bottom - rect->top;
+
+    snprintf(value, sizeof(value), "%d", ctx->index);
+    snprintf(label, sizeof(label), "%s %d: %dx%d (%ld,%ld)",
+             obs_module_text("MonitorLabel"),
+             ctx->index + 1,
+             width,
+             height,
+             rect->left,
+             rect->top);
+
+    obs_property_list_add_string(ctx->list, label, value);
+    ctx->index++;
+    return TRUE;
+}
+
+static void populate_monitor_list(obs_property_t *list)
+{
+    if (!list)
+        return;
+
+    obs_property_list_clear(list);
+    struct monitor_enum_ctx ctx = {0};
+    ctx.list = list;
+    EnumDisplayMonitors(NULL, NULL, enum_monitors_fill_list_proc, (LPARAM)&ctx);
+}
+
+static BOOL CALLBACK enum_monitors_find_proc(HMONITOR monitor, HDC hdc, LPRECT rect, LPARAM lparam)
+{
+    UNUSED_PARAMETER(monitor);
+    UNUSED_PARAMETER(hdc);
+
+    struct monitor_enum_ctx *ctx = (struct monitor_enum_ctx *)lparam;
+    char value[32];
+    snprintf(value, sizeof(value), "%d", ctx->index);
+
+    if (ctx->target_id && strcmp(ctx->target_id, value) == 0) {
+        if (ctx->out_info) {
+            strncpy_s(ctx->out_info->id, sizeof(ctx->out_info->id), value, _TRUNCATE);
+            ctx->out_info->rect = *rect;
+        }
+        ctx->found = true;
+        return FALSE;
+    }
+
+    ctx->index++;
+    return TRUE;
+}
+
+static bool get_monitor_info_by_id(const char *monitor_id, struct monitor_info *out_info)
+{
+    if (!monitor_id || !*monitor_id || !out_info)
+        return false;
+
+    struct monitor_enum_ctx ctx = {0};
+    ctx.target_id = monitor_id;
+    ctx.out_info = out_info;
+    EnumDisplayMonitors(NULL, NULL, enum_monitors_find_proc, (LPARAM)&ctx);
+    return ctx.found;
+}
+
+static void sync_capture_rect_from_monitor(obs_data_t *settings)
+{
+    if (!settings)
+        return;
+
+    const char *monitor_id = obs_data_get_string(settings, "monitor_id");
+    struct monitor_info info;
+    if (!get_monitor_info_by_id(monitor_id, &info))
+        return;
+
+    obs_data_set_int(settings, "capture_left", info.rect.left);
+    obs_data_set_int(settings, "capture_top", info.rect.top);
+    obs_data_set_int(settings, "capture_width", info.rect.right - info.rect.left);
+    obs_data_set_int(settings, "capture_height", info.rect.bottom - info.rect.top);
+}
+
+static bool monitor_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+    UNUSED_PARAMETER(props);
+    UNUSED_PARAMETER(property);
+    sync_capture_rect_from_monitor(settings);
     return true;
 }
 
@@ -182,13 +285,25 @@ static void browser_mask_filter_update(void *data, obs_data_t *settings)
         return;
 
     bfree(filter->process_names);
+    bfree(filter->monitor_id);
+
     filter->process_names = bstrdup(obs_data_get_string(settings, "process_names"));
-    filter->capture_left = (int)obs_data_get_int(settings, "capture_left");
-    filter->capture_top = (int)obs_data_get_int(settings, "capture_top");
-    filter->capture_width = (int)obs_data_get_int(settings, "capture_width");
-    filter->capture_height = (int)obs_data_get_int(settings, "capture_height");
+    filter->monitor_id = bstrdup(obs_data_get_string(settings, "monitor_id"));
     filter->padding = (int)obs_data_get_int(settings, "padding");
     filter->debug_fullscreen_red = obs_data_get_bool(settings, "debug_fullscreen_red");
+
+    struct monitor_info info;
+    if (get_monitor_info_by_id(filter->monitor_id, &info)) {
+        filter->capture_left = info.rect.left;
+        filter->capture_top = info.rect.top;
+        filter->capture_width = info.rect.right - info.rect.left;
+        filter->capture_height = info.rect.bottom - info.rect.top;
+
+        obs_data_set_int(settings, "capture_left", filter->capture_left);
+        obs_data_set_int(settings, "capture_top", filter->capture_top);
+        obs_data_set_int(settings, "capture_width", filter->capture_width);
+        obs_data_set_int(settings, "capture_height", filter->capture_height);
+    }
 }
 
 static void *browser_mask_filter_create(obs_data_t *settings, obs_source_t *source)
@@ -206,6 +321,7 @@ static void browser_mask_filter_destroy(void *data)
         return;
 
     bfree(filter->process_names);
+    bfree(filter->monitor_id);
     bfree(filter);
 }
 
@@ -215,63 +331,30 @@ static obs_properties_t *browser_mask_filter_properties(void *data)
 
     obs_properties_t *props = obs_properties_create();
 
-    obs_properties_add_text(
-        props,
-        "process_names",
-        obs_module_text("ProcessNames"),
-        OBS_TEXT_MULTILINE);
+    obs_properties_add_text(props, "process_names", obs_module_text("ProcessNames"), OBS_TEXT_MULTILINE);
 
-    obs_properties_add_int(
+    obs_property_t *monitor_prop = obs_properties_add_list(
         props,
-        "capture_left",
-        obs_module_text("CaptureLeft"),
-        -32768, 32767, 1);
+        "monitor_id",
+        obs_module_text("TargetMonitor"),
+        OBS_COMBO_TYPE_LIST,
+        OBS_COMBO_FORMAT_STRING);
+    populate_monitor_list(monitor_prop);
+    obs_property_set_modified_callback(monitor_prop, monitor_modified);
 
-    obs_properties_add_int(
-        props,
-        "capture_top",
-        obs_module_text("CaptureTop"),
-        -32768, 32767, 1);
-
-    obs_properties_add_int(
-        props,
-        "capture_width",
-        obs_module_text("CaptureWidth"),
-        1, 10000, 1);
-
-    obs_properties_add_int(
-        props,
-        "capture_height",
-        obs_module_text("CaptureHeight"),
-        1, 10000, 1);
-
-    obs_properties_add_int(
-        props,
-        "padding",
-        obs_module_text("Padding"),
-        0, 1000, 1);
-
-    obs_properties_add_bool(
-        props,
-        "debug_fullscreen_red",
-        "Debug: always draw full-screen red overlay");
+    obs_properties_add_int(props, "padding", obs_module_text("Padding"), 0, 1000, 1);
+    obs_properties_add_bool(props, "debug_fullscreen_red", obs_module_text("DebugAlwaysRed"));
 
     return props;
 }
 
 static void browser_mask_filter_defaults(obs_data_t *settings)
 {
-    obs_data_set_default_string(
-        settings,
-        "process_names",
-        "chrome.exe\nmsedge.exe\nfirefox.exe\nbrave.exe");
-
-    obs_data_set_default_int(settings, "capture_left", 0);
-    obs_data_set_default_int(settings, "capture_top", 0);
-    obs_data_set_default_int(settings, "capture_width", 3840);
-    obs_data_set_default_int(settings, "capture_height", 2160);
+    obs_data_set_default_string(settings, "process_names", "chrome.exe\nmsedge.exe\nfirefox.exe\nbrave.exe");
+    obs_data_set_default_string(settings, "monitor_id", "0");
     obs_data_set_default_int(settings, "padding", 8);
     obs_data_set_default_bool(settings, "debug_fullscreen_red", false);
+    sync_capture_rect_from_monitor(settings);
 }
 
 static uint32_t browser_mask_filter_get_width(void *data)
@@ -294,8 +377,7 @@ static uint32_t browser_mask_filter_get_height(void *data)
     return target ? obs_source_get_base_height(target) : 0;
 }
 
-static void draw_solid_rect(float x, float y, float w, float h,
-                            float r, float g, float b, float a)
+static void draw_solid_rect(float x, float y, float w, float h, float r, float g, float b, float a)
 {
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
     if (!solid)
@@ -332,12 +414,10 @@ static void browser_mask_filter_render(void *data, gs_effect_t *effect)
 
     uint32_t width = obs_source_get_base_width(target);
     uint32_t height = obs_source_get_base_height(target);
-
     if (width == 0 || height == 0) {
         width = obs_source_get_width(target);
         height = obs_source_get_height(target);
     }
-
     if (width == 0 || height == 0)
         return;
 
@@ -380,15 +460,14 @@ static void browser_mask_filter_render(void *data, gs_effect_t *effect)
         return;
     }
 
-    blog(LOG_INFO,
-         "[obs-browser-auto-mask] draw rect: left=%ld top=%ld right=%ld bottom=%ld",
-         intersection.left, intersection.top, intersection.right, intersection.bottom);
-
     const int pad = filter->padding;
-    float local_left = (float)(intersection.left - capture_rect.left - pad);
-    float local_top = (float)(intersection.top - capture_rect.top - pad);
-    float local_right = (float)(intersection.right - capture_rect.left + pad);
-    float local_bottom = (float)(intersection.bottom - capture_rect.top + pad);
+    float scale_x = filter->capture_width > 0 ? (float)width / (float)filter->capture_width : 1.0f;
+    float scale_y = filter->capture_height > 0 ? (float)height / (float)filter->capture_height : 1.0f;
+
+    float local_left = ((float)(intersection.left - capture_rect.left) - (float)pad) * scale_x;
+    float local_top = ((float)(intersection.top - capture_rect.top) - (float)pad) * scale_y;
+    float local_right = ((float)(intersection.right - capture_rect.left) + (float)pad) * scale_x;
+    float local_bottom = ((float)(intersection.bottom - capture_rect.top) + (float)pad) * scale_y;
 
     if (local_left < 0.0f)
         local_left = 0.0f;
@@ -399,9 +478,16 @@ static void browser_mask_filter_render(void *data, gs_effect_t *effect)
     if (local_bottom > (float)height)
         local_bottom = (float)height;
 
+    blog(LOG_INFO,
+         "[obs-browser-auto-mask] monitor-only-v1 browser=(%ld,%ld,%ld,%ld) capture=(%ld,%ld,%ld,%ld) render=%ux%u scale=(%.4f,%.4f) final=(%.1f,%.1f,%.1f,%.1f)",
+         browser_rect.left, browser_rect.top, browser_rect.right, browser_rect.bottom,
+         capture_rect.left, capture_rect.top, capture_rect.right, capture_rect.bottom,
+         width, height,
+         scale_x, scale_y,
+         local_left, local_top, local_right, local_bottom);
+
     float rect_w = local_right - local_left;
     float rect_h = local_bottom - local_top;
-
     if (rect_w > 0.0f && rect_h > 0.0f)
         draw_solid_rect(local_left, local_top, rect_w, rect_h, 0.0f, 0.0f, 0.0f, 1.0f);
 
