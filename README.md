@@ -1,3 +1,8 @@
+最初にobs-plugintemplateをクローンする
+```cmd
+git clone https://github.com/obsproject/obs-plugintemplate.git
+```
+downloadしたのを、ぽいぽいしてからビルド
 ```cmd
 cd C:\Users\DDdin\Desktop\obs-plugintemplate
 cmake --list-presets
